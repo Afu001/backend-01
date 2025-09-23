@@ -1,3 +1,4 @@
+// server.js
 import express from "express";
 import multer from "multer";
 import cors from "cors";
@@ -5,12 +6,18 @@ import sqlite3 from "sqlite3";
 import { open } from "sqlite";
 import path from "path";
 import fs from "fs";
+import nodemailer from "nodemailer";
+import dotenv from "dotenv";
 
-// make sure uploads dir exists
-const UPLOAD_DIR = path.join(process.cwd(), "uploads");
+dotenv.config();
+
+const PORT = process.env.PORT || 5000;
+const UPLOAD_DIR = path.join(process.cwd(), process.env.UPLOAD_DIR || "uploads");
+
+// Ensure upload dir exists
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-// multer config — keep original extension
+// Multer config — keep original extension, but use safe generated name
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOAD_DIR),
   filename: (req, file, cb) => {
@@ -37,15 +44,13 @@ const upload = multer({
 const app = express();
 app.use(cors());
 app.use(express.json());
-
-// serve uploaded files at /uploads/<filename>
 app.use("/uploads", express.static(UPLOAD_DIR));
 
-// DB setup
+// --- Database ---
 let db;
 (async () => {
   db = await open({
-    filename: "applicants.db",
+    filename: process.env.DB_FILE || "applicants.db",
     driver: sqlite3.Database,
   });
 
@@ -62,7 +67,38 @@ let db;
       createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
-})();
+})().catch((err) => {
+  console.error("DB init error:", err);
+  process.exit(1);
+});
+
+// --- Nodemailer transporter ---
+if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+  console.warn("⚠️ EMAIL_USER or EMAIL_PASS not set in .env. Email will fail until configured.");
+}
+
+const transporter = nodemailer.createTransport({
+  host: "smtp.zoho.com",
+  port: 465, // SSL
+  secure: true,
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
+  },
+  tls: {
+    // 👇 allow self-signed / unverified certs
+    rejectUnauthorized: false,
+  },
+});
+
+
+
+// verify transporter at startup
+transporter.verify().then(() => {
+  console.log("✅ Mail transporter ready");
+}).catch((err) => {
+  console.warn("⚠️ Mail transporter verification failed:", err.message);
+});
 
 // ---- Routes ----
 
@@ -70,15 +106,57 @@ let db;
 app.post("/apply", upload.single("resume"), async (req, res) => {
   try {
     const { firstName, lastName, email, phone, position, coverLetter } = req.body;
-    const resumePath = req.file ? req.file.filename : null; // ✅ store only filename
+    const resumePath = req.file ? req.file.filename : null;
 
-    await db.run(
+    const result = await db.run(
       `INSERT INTO applicants (firstName, lastName, email, phone, position, coverLetter, resumePath)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
       [firstName, lastName, email, phone, position, coverLetter, resumePath]
     );
 
-    res.json({ success: true, message: "Application submitted successfully!" });
+    const insertedId = result.lastID;
+
+    // Build email
+    const applicantName = (firstName || "") + (lastName ? ` ${lastName}` : "");
+    const subject = `Application received — ${position || "Application"}`;
+    const host = `${req.protocol}://${req.get("host")}`;
+    const resumeUrl = resumePath ? `${host}/uploads/${resumePath}` : null;
+
+    // Compose base message (plain + html)
+    const text = `Hello ${firstName || "Applicant"},\n\nThank you for applying for the position of ${position || "the role"}.
+We have received your application and will review it. If we need more information, we will contact you at ${email}.\n\nBest regards,\nHR Team`;
+
+    const html = `
+      <p>Hello <strong>${firstName || "Applicant"}</strong>,</p>
+      <p>Thank you for applying for the <strong>${position || "role"}</strong>. We have received your application and will review it. If we need more information, we will contact you at <a href="mailto:${email}">${email}</a>.</p>
+      ${resumeUrl ? `<p>Your uploaded resume: <a href="${resumeUrl}">Download</a></p>` : ""}
+      <p>Best regards,<br/>HR Team</p>
+    `;
+
+    // Attach resume to email if you want to send it back to the applicant
+    const attachments = [];
+    if (req.file) {
+      attachments.push({
+        filename: req.file.originalname || `resume${path.extname(req.file.filename)}`,
+        path: path.join(UPLOAD_DIR, req.file.filename),
+      });
+    }
+
+    // Send confirmation email
+    const mailOptions = {
+      from: `"HR Team" <${process.env.EMAIL_USER}>`,
+      to: email,
+      subject,
+      text,
+      html,
+      attachments,
+      // optionally BCC HR/internal
+      bcc: process.env.HR_EMAIL || undefined,
+    };
+
+    await transporter.sendMail(mailOptions);
+
+    res.json({ success: true, message: "Application submitted & confirmation email sent!", id: insertedId });
   } catch (err) {
     console.error("❌ Apply error:", err.message);
     res.status(500).json({ success: false, message: "Failed to save application" });
@@ -129,13 +207,14 @@ app.get("/resume/:id", async (req, res) => {
     const fullPath = path.join(UPLOAD_DIR, applicant.resumePath);
     if (!fs.existsSync(fullPath)) return res.status(404).json({ message: "File missing" });
 
-    res.download(fullPath, `${applicant.firstName || "resume"}${path.extname(fullPath)}`);
+    res.download(fullPath, `${(applicant.firstName || "resume")}${path.extname(fullPath)}`);
   } catch (err) {
     console.error("❌ Resume error:", err.message);
     res.status(500).json({ message: "Failed to download resume" });
   }
 });
 
-// ---- Start ----
-const PORT = 5000;
-app.listen(PORT, () => console.log(`✅ Server running at http://localhost:${PORT}`));
+// Start
+app.listen(PORT, () => {
+  console.log(`✅ Server running at http://localhost:${PORT}`);
+});
